@@ -1,0 +1,340 @@
+---
+title: "Crea tu propio festival"
+author: "Karina Bartolomé"
+date: "2022-11-30"
+output: html_document
+---
+
+# Instafest
+
+Hace unos días se difundió el uso de una aplicación para generar un flyer de un festival ficticio a partir de datos de tus artistas más escuchados en Spotify. Esto me llevó a querer reproducir el análisis en R. 
+
+A continuación se presentan los pasos para generar el flyer de tu festival:
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      eval = TRUE,
+                      warning = FALSE, 
+                      message = FALSE)
+
+options(scipen=999)
+```
+
+
+# 1. Librerías y definiciones
+
+```{r}
+library(spotifyr)
+library(tidyverse)
+library(tibble)
+library(tidymodels)
+library(gt)
+library(broom)
+library(ggimage)
+library(ggwordcloud)
+library(showtext)
+library(ggtext)
+library(rjson)
+```
+
+> Definición de fuente a utilizar para el texto:
+
+```{r, code_folding=TRUE}
+font_add_google(name = "Slackey", family = "custom_font")
+showtext_auto()
+```
+
+Para poder acceder a datos de Spotify, se utilizará el paquete **{spotifyr}** 📦. Realizamos un taller desde **RladiesBA** sobre el tema: [Creando tablas en {gt} con Spotify API & Bad Bunny
+](https://karbartolome.github.io/gt-spotify/01_slides/rladies_gt_spotify.html) e incluimos un [Documento de configuración de credenciales](https://github.com/karbartolome/gt-spotify/blob/main/Pasos%20previos%20al%20taller%20gt%20%2B%20spotify.pdf)
+
+> Definición de credenciales para la conexión a la API de Spotify:
+
+```{r, eval=FALSE, code_folding=TRUE}
+credentials <- fromJSON(file = "credentials.json")
+
+Sys.setenv(SPOTIFY_CLIENT_ID = credentials$SPOTIFY_CLIENT_ID)
+Sys.setenv(SPOTIFY_CLIENT_SECRET = credentials$SPOTIFY_CLIENT_SECRET)
+
+access_token <- get_spotify_access_token(
+  client_id = Sys.getenv("SPOTIFY_CLIENT_ID"),
+  client_secret = Sys.getenv("SPOTIFY_CLIENT_SECRET")
+)
+```
+
+
+
+# Data
+
+Se obtiendn datos de los 50 artistas más escuchados en el mediano plazo:
+
+```{r, eval=FALSE}
+df <- get_my_top_artists_or_tracks(type = 'artists',
+                                   time_range = 'medium_term',
+                                   limit = 50)
+```
+
+```{r, eval=FALSE, echo=FALSE}
+saveRDS(df, 'df.rds')
+```
+
+```{r, echo=FALSE}
+df <- readRDS('df.rds')
+```
+
+Los artistas aparecen en orden de más a menos escuchado. Se visualizan los 🎶 **5 artistas más escuchados** 🎶 :
+
+```{r, code_folding=TRUE}
+df %>%
+  select(name, genres, followers.total) %>%
+  janitor::clean_names() %>% 
+  head(5) %>% 
+  rowwise() %>%
+  mutate(genres = paste(genres, collapse = ', ')) %>%
+  ungroup %>%
+  gt() %>% 
+  tab_header(title=md('**Artistas más escuchados** en el mediano plazo')) %>% 
+  opt_align_table_header('left') %>% 
+  fmt_number(all_numeric(), decimals=2)
+```
+
+# Transformaciones 
+
+Para poder generar el flyer, se busca clusterizar a los artistas en 3 grupos (días del festival). Se realizan algunas transformaciones iniciales para poder utilizar estos datos para generar la clusterización. 
+
+EL primer paso consiste en generar variables a partir de cada una de las listas de géneros incluidas en cada artista. Luego, se pivotean los datos para obtener un registro por artista. Habiendo obtenido la tabla en formato correcto, se imputan los valores faltantes con 0. De esta forma, se cuenta con una matriz, en donde cada columna es un genero y cada fila es un artista. Si el artista pertenece a un género aparece un 1, y un 0 en caso contrario. 
+
+```{r}
+df_clusters <- df %>%
+  
+  select(artist = name, genres) %>%
+  
+  unnest_longer(genres) %>%
+  
+  mutate(value = 1) %>%
+  
+  pivot_wider(id_cols = artist,
+              names_from = genres,
+              values_from = value) %>%
+  
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), 0, 1))) %>%
+  
+  left_join(df %>% select(followers.total, artist = name) %>%
+              rownames_to_column('relevance')) %>%
+  
+  janitor::clean_names()
+```
+
+Visualizando las primeras 2 observaciones:
+
+```{r, code_folding=TRUE}
+df_clusters %>% head(2) %>% gt()
+```
+
+Se observa que el dataframe final cuenta con 102 variables para las 50 observaciones que se intentará clusterizar: 
+
+```{r}
+dim(df_clusters)
+```
+
+# Modelado
+
+## Preprocesamiento
+ 
+Se utiliza **{tidymodels}** 📦 para generar una receta simple de preprocesamiento de datos. En este caso, eliminando variables con varianza cercana a 0: 
+
+```{r}
+preproc <- recipe( ~ ., data = df_clusters) %>%
+  
+  update_role(artist, new_role = 'id') %>%
+  
+  step_rm(followers_total, relevance) %>%
+  
+  step_nzv(all_numeric()) 
+```
+
+Se transforman los datos con la receta de preproecsamiento:
+
+```{r}
+df_processed <- preproc %>%
+  prep() %>%
+  juice()
+```
+
+Ahora se cuenta con solo 27 variables para las 50 observaciones:
+
+```{r}
+dim(df_processed)
+```
+
+## Clustering
+
+Se utiliza el algoritmo **kmeans** para segmentar a los artistas en 3 grupos (3 centroides):
+
+```{r}
+set.seed(1234)
+artists_clusters <- df_processed %>%
+  column_to_rownames('artist') %>%
+  kmeans(centers = 3)
+```
+
+Se utiliza la función **augment()** del paquete **{broom}** 📦, incluido en tidymodels, para concatenar la columna de cluster al df original:
+
+```{r}
+df_final <- broom::augment(artists_clusters, df_clusters)
+```
+
+```{r}
+df_final %>% 
+  group_by(.cluster) %>% 
+  summarise(n=n())
+```
+
+
+# Flyer
+
+Para la generación del flyer se utiliza {ggplot2} 📦. Antes de generar el gráfico, es necesario realizar ciertas transformaciones iniciales:
+
+1. Se obtienen los ids de relevancia del artista en cada uno de los clusters:
+
+```{r}
+df_flyer <- df_final %>% 
+  
+  select(artist, .cluster, relevance) %>%
+  
+  group_by(.cluster) %>% 
+  
+  mutate(relevance = match(artist, unique(artist))) %>%
+  
+  ungroup()
+```
+
+Notar que, por ejemplo, Las Ligas Menores es el segundo artista más escuchado pero aparecen con relevance = 1. Esto se da porque es el artista más escuchado dentro del cluster=2 (al cual se asignó la banda en el momento de la clusterización).
+
+```{r, code_folding=TRUE}
+df_flyer %>% 
+  DT::datatable()
+```
+
+Luego de haber generado el orden de relevancia de cada artista en cada cluster, se definen los labels (tamaños del texto de cada artista en el flyer). Para ello, se considera que los artistas con relevance==1 serán los que aparezcan arriba de todo, con un tamaño mayor. Luego vendrá una fila con los siguientes 3 artistas más relevantes por clusters. Luego otra fila y así hasta incluir a todos. Dentro de esta sección, se utiliza html para generar los labels que correspondan. 
+
+```{r}
+df_flyer <- df_flyer %>% 
+  
+  mutate(label = case_when(
+    relevance==1~paste0(artist,'<br>'),
+    relevance==4~paste0(artist,'<br>'),
+    relevance==9~paste0(artist,'<br>'),
+    TRUE ~ paste0(artist,' ◇ '))
+  ) %>% 
+  
+  mutate(label = case_when(
+    relevance<=1~paste0("<span style = 'color: white; font-size: 30px'>", label,' </span>'),
+    relevance<=4~paste0("<span style = 'color: white; font-size: 20px'>", label,' </span>'),
+    relevance<=9~paste0("<span style = 'color: white; font-size: 15px'>", label,' </span>'),
+    TRUE ~ paste0("<span style = 'color: white; font-size: 10px'>", label,' </span>'))  
+  ) 
+```
+
+Finalmente, **se agrupa por artista** para colapsar los labels en un único registro por día (cluster):
+
+```{r}
+df_flyer <- df_flyer %>% 
+  
+  group_by(dia=.cluster) %>% 
+  
+  summarise(label=paste(label, collapse=' ')) %>% 
+  
+  ungroup() 
+```
+
+Ahora sí, teniendo el dataframe en el formato necesario para el Flyer se crea el **ggplot** final ✨:
+
+```{r}
+font_color = 'white'
+
+p <- df_flyer %>%
+  
+  ggplot(aes(x = 0.5, y = 0.5, label = label)) +
+    geom_richtext(label.color = NA, fill = NA) +
+    facet_wrap( ~ paste0('Día ', dia), nrow = 3) +
+    ylim(c(0, 1)) +
+    labs(title = 'GGFEST 2023',
+         caption = 'Invita R')
+```
+
+Se añaden ciertos aspectos de **estilo** al plot:
+
+```{r, code_folding=TRUE, eval=TRUE}
+p <- p +
+  theme_void() +
+  theme(
+    plot.margin = unit(c(7, 0, 12, 0), "cm"),
+    strip.text = element_text(
+      colour = font_color, size = 20,
+      family = 'custom_font'
+    ),
+    text = element_text(),
+    plot.title = element_text(
+      family = 'custom_font',
+      hjust = 0.5,
+      size = 40,
+      color = font_color,
+      margin = margin(0, 0, 30, 0)
+    ),
+    plot.caption = element_text(
+      hjust = 0.8,
+      size = 10,
+      color = font_color
+    ),
+    panel.spacing.y = unit(0, "lines")
+  )
+```
+
+Para visualizarlo, se colorea el fondo (dado que el color del texto es blanco):
+
+```{r, fig.width=10, fig.height=10, code_folding=TRUE, eval=FALSE}
+p + theme(plot.background = element_rect(fill='#53358f'))
+```
+
+```{r, eval=FALSE, echo=FALSE}
+showtext_auto(enable = TRUE)
+showtext_opts(dpi=350)
+ggsave(
+  'ggfest_raw.png',
+  plot = p + theme(
+    plot.margin = unit(c(3, 0, 5, 0), "cm"),
+    strip.text = element_text(
+      colour = font_color,
+      size = 20,
+      family = 'custom_font'
+    ),
+    plot.background = element_rect(fill = '#53358f')
+  ),
+  height = 10,
+  width=10, scale=1
+)
+```
+
+
+Se añade una **imagen como fondo del gráfico**:
+
+```{r, eval=FALSE}
+plot_with_background <- p %>% 
+  ggbackground(background='ggfest_blank.png')
+```
+
+# Save flyer
+
+Para guardar el flyer, se utiliza la funcíón **ggsave()** de **{ggplot2}** 📦:
+
+```{r, eval=FALSE}
+showtext_auto(enable = TRUE)
+showtext_opts(dpi=1000)
+ggsave('ggfest.png', 
+       plot=plot_with_background, 
+       height=25, width=25, scale=1
+)
+```
+
+
+
